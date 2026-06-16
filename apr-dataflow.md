@@ -39,7 +39,7 @@ flowchart TB
     %% === LOCALIZATION PATH ===
     TestRunner_A[TestRunner_A<br/>processor<br/><i>run full suite → failures</i>]:::processor
     FailLocator[FailLocator<br/>processor<br/><i>stack trace → file:line</i>]:::processor
-    ContextCollect[ContextCollector<br/>processor<br/><i>D: method+test | E: trace slice</i>]:::processor
+    ContextCollect[ContextCollector<br/>processor<br/><i>D: method+test &vert; E: trace slice</i>]:::processor
 
     BugRow[\"BugRow<br/>{file, line, method, test}"/]
     TestResult[\"TestResultRow<br/>{failures: [{test, stack}]}"/]
