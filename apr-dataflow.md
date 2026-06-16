@@ -25,39 +25,39 @@ flowchart TB
     classDef outputter fill:#4a148c,color:#fff,stroke:#311b92
     classDef tokenOp fill:#e65100,color:#fff,stroke:#bf360c
     classDef llm fill:#00695c,color:#fff,stroke:#004d40
+    classDef disk fill:#555,color:#fff,stroke:#333,stroke-dasharray: 5 5
 
     %% === EXTRACTOR ===
-    Checkout[\"Defects4jCheckout<br/>extractor<br/><i>checkout + walk src + export tests</i>"/]:::extractor
+    Checkout[\"Defects4jCheckout<br/>extractor<br/><i>checkout + export tests</i>"/]:::extractor
 
     %% === STREAMS ===
-    SrcRows[\"SourceRow+<br/>{file_path, content}"/]
-    TestRows[\"TestRow+<br/>{triggering, relevant}"/]
+    ProjRow[\"ProjectRow<br/>{project_dir, bug_id, triggering, relevant}"/]
 
-    Checkout -->|"im+"| SrcRows
-    Checkout -->|"im+"| TestRows
+    Checkout -->|"im+"| ProjRow
 
-    %% === LOCALIZATION PATH ===
-    TestRunner_A[TestRunner_A<br/>processor<br/><i>run full suite → failures</i>]:::processor
-    FailLocator[FailLocator<br/>processor<br/><i>stack trace → file:line</i>]:::processor
-    ContextCollect[ContextCollector<br/>processor<br/><i>D: method+test &vert; E: trace slice</i>]:::processor
+    %% === LOCALIZATION (no SourceRow — source lives on disk) ===
+    TestRunner_A[TestRunner_A<br/>processor<br/><i>compile → run suite →<br/>parse stack → BugRow</i>]:::processor
 
-    BugRow[\"BugRow<br/>{file, line, method, test}"/]
-    TestResult[\"TestResultRow<br/>{failures: [{test, stack}]}"/]
-    CtxRow[\"ContextRow<br/>{level, method, test, trace}"/]
+    BugRow[\"BugRow<br/>{project_dir, file, line, method, test}"/]
 
-    SrcRows -->|"i"| TestRunner_A
-    TestRows -->|"im+"| TestRunner_A
-    TestRunner_A -->|"im+"| TestResult
-    TestResult -->|"im+"| FailLocator
-    FailLocator -->|"im+"| BugRow
+    ProjRow -->|"im+"| TestRunner_A
+    TestRunner_A -->|"im+"| BugRow
+
+    %% === CONTEXT COLLECTOR (reads from disk on-demand) ===
+    ContextCollect[ContextCollector<br/>processor<br/><i>D: method+test &vert; E: trace slice<br/>reads files from disk</i>]:::processor
+    Disk1[(Disk<br/>project files)]:::disk
+
+    CtxRow[\"ContextRow<br/>{level, method_src, test_src, trace}"/]
+
     BugRow -->|"im+"| ContextCollect
+    Disk1 -.->|"read on-demand"| ContextCollect
     ContextCollect -->|"im+"| CtxRow
 
     %% === CONJECTURE GENERATION ===
     PromptBuilder[PromptBuilder<br/>processor<br/><i>context → LLM prompt</i>]:::processor
     TokenOptimizer[TokenOptimizer<br/>processor<br/><i>compress code context</i>]:::tokenOp
     LLMCaller[LLMCaller<br/>processor<br/><i>API call → patch</i>]:::llm
-    PatchApplier[PatchApplier<br/>processor<br/><i>apply old→new string</i>]:::processor
+    PatchApplier[PatchApplier<br/>processor<br/><i>apply old→new string<br/>writes to disk</i>]:::processor
     TestRunner_B[TestRunner_B<br/>processor + errorHandler<br/><i>pass | fail | eventually</i>]:::errorHandler
     VerdictOut[\"VerdictOutputter<br/>outputter<br/><i>fixed / unfixed results</i>"/]:::outputter
 
@@ -75,6 +75,7 @@ flowchart TB
     OptimizedRow -->|"im+"| LLMCaller
     LLMCaller -->|"im+"| PatchRow
     PatchRow -->|"im+"| PatchApplier
+    Disk1 -.->|"read file for backup"| PatchApplier
     PatchApplier -->|"im+"| AppliedRow
     AppliedRow -->|"im+"| TestRunner_B
 
@@ -98,7 +99,7 @@ flowchart TB
 ```mermaid
 stateDiagram-v2
     state "Conjecture (strategy, model, context, compression)" as CONJ
-    
+
     [*] --> CONJ: PromptBuilder emits
     CONJ --> Running: flows forward through pipeline
     Running --> Pass: TestRunner_B.pass
@@ -116,22 +117,53 @@ stateDiagram-v2
 
 ---
 
-## Conjecture Escalation Order
+## Conjecture Space — 32 Combinations
 
-```mermaid
-flowchart LR
-    subgraph ORDER["TestRunner_B tries conjectures in order"]
-        C1["C1: light model + D-context + generic prompt + aggro compression"]
-        C2["C2: light model + D-context + CoT prompt + aggro compression"]
-        C3["C3: light model + E-context + generic prompt + aggro compression"]
-        C4["C4: heavy model + E-context + CoT prompt + gentle compression"]
-    end
+| Dimension | Values | Count |
+|---|---|---|
+| Context level | D, E | 2 |
+| Model tier | light, heavy | 2 |
+| Token compression | aggro, gentle | 2 |
+| Prompt strategy | generic, CoT, minimal-change, TDD | 4 |
 
-    C1 -->|fail| C2
-    C2 -->|fail| C3
-    C3 -->|fail| C4
-    C4 -->|fail| eventually
-```
+Total: 2 × 2 × 2 × 4 = **32**
+
+### Escalation Order
+
+Cheapest conjectures first, ordered by cost:
+
+1. light + D + generic + aggro
+2. light + D + CoT + aggro
+3. light + D + minimal-change + aggro
+4. light + D + TDD + aggro
+5. light + D + generic + gentle
+6. light + D + CoT + gentle
+7. light + D + minimal-change + gentle
+8. light + D + TDD + gentle
+9. light + E + generic + aggro
+10. light + E + CoT + aggro
+11. light + E + minimal-change + aggro
+12. light + E + TDD + aggro
+13. light + E + generic + gentle
+14. light + E + CoT + gentle
+15. light + E + minimal-change + gentle
+16. light + E + TDD + gentle
+17. heavy + D + generic + aggro
+18. heavy + D + CoT + aggro
+19. heavy + D + minimal-change + aggro
+20. heavy + D + TDD + aggro
+21. heavy + D + generic + gentle
+22. heavy + D + CoT + gentle
+23. heavy + D + minimal-change + gentle
+24. heavy + D + TDD + gentle
+25. heavy + E + generic + aggro
+26. heavy + E + CoT + aggro
+27. heavy + E + minimal-change + aggro
+28. heavy + E + TDD + aggro
+29. heavy + E + generic + gentle
+30. heavy + E + CoT + gentle
+31. heavy + E + minimal-change + gentle
+32. heavy + E + TDD + gentle
 
 ---
 
@@ -139,18 +171,18 @@ flowchart LR
 
 | Edge | Label | Why |
 |---|---|---|
-| `Checkout → Sources` | `im+` | New bug = new source files |
-| `Sources → TestRunner_A` | `i` | Re-localization needs re-run |
-| `TestRunner_A → FailLocator` | `im+` | New failures → new locations |
-| `FailLocator → ContextCollector` | `im+` | New location → new context |
+| `Checkout → ProjectRow` | `im+` | New bug = new project row |
+| `ProjectRow → TestRunner_A` | `i` | Re-localization needs re-run |
+| `TestRunner_A → BugRow` | `im+` | New failures → new bug rows |
+| `BugRow → ContextCollector` | `im+` | New location → new context (disk) |
 | `ContextCollector → PromptBuilder` | `im+` | New context → new prompt |
 | `PromptBuilder → TokenOptimizer` | `im+` | New prompt → optimize |
 | `TokenOptimizer → LLMCaller` | `im+` | Optimize → API call |
-| `LLMCaller → PatchApplier` | `im+` | New patch → apply |
+| `LLMCaller → PatchApplier` | `im+` | New patch → apply (to disk) |
 | `PatchApplier → TestRunner_B` | `im+` | Applied → validate |
 | `TestRunner_B.pass → VerdictOut` | `im+` | Passed → emit |
 | `TestRunner_B.eventually → VerdictOut` | `im+` | Exhausted → emit (unfixed) |
 | `← TestRunner_B → ContextCollector` | **backward** | `∆⁻`(D) + `∆⁺`(E) — escalate context |
-| `← TestRunner_B → PromptBuilder` | **backward** | `∆⁻`(generic) + `∆⁺`(CoT) — change strategy |
+| `← TestRunner_B → PromptBuilder` | **backward** | `∆⁻`(old) + `∆⁺`(new) — change strategy |
 | `← TestRunner_B → LLMCaller` | **backward** | `∆⁻`(light) + `∆⁺`(heavy) — upgrade model |
 | `← TestRunner_B → TokenOptimizer` | **backward** | `∆⁻`(aggro) + `∆⁺`(gentle) — reduce compression |

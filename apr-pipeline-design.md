@@ -59,23 +59,26 @@ Popper is a **reactive dataflow** system with explicit error handling operators.
 ### 3.1 Forward Flow
 
 ```
-Checkout → TestRunner_A → FailLocator → ContextCollector → PromptBuilder → TokenOptimizer → LLMCaller → PatchApplier → TestRunner_B → VerdictOutputter
+Checkout → TestRunner_A → ContextCollector → PromptBuilder → TokenOptimizer → LLMCaller → PatchApplier → TestRunner_B → VerdictOutputter
 ```
 
 ### 3.2 Operator Catalog
 
 | Operator | Type | Input | Output | Description |
 |---|---|---|---|---|
-| **Defects4jCheckout** | extractor | (none) | SourceRow+, TestRow+ | Checkout buggy source, walk src directory, export trigger/relevant tests |
-| **TestRunner_A** | processor | SourceRow, TestRow | TestResultRow | Run full relevant test suite → collect failures with stack traces |
-| **FailLocator** | processor | TestResultRow | BugRow | Parse stack trace → filter out framework frames → first project-owned frame = bug location (file:line) |
-| **ContextCollector** | processor | BugRow | ContextRow (level D or E) | D: surrounding method + triggering test file; E: full trace slice (call stack frames with source) |
-| **PromptBuilder** | processor | ContextRow | PromptRow | Assemble LLM prompt from context using a strategy (generic, CoT, minimal-change, TDD) |
-| **TokenOptimizer** | processor | PromptRow | OptPromptRow | Compress only the code context portion of the prompt (not system instructions) to fit token limits |
+| **Defects4jCheckout** | extractor | (none) | ProjectRow | Checkout buggy source, export trigger/relevant tests |
+| **TestRunner_A** | processor | ProjectRow | BugRow | Compile → run suite → parse stack trace → emit bug location (file:line). Merges FailLocator. |
+| **ContextCollector** | processor | BugRow | ContextRow (D or E) | Reads files from disk on-demand. D: method + test; E: full trace slice |
+| **PromptBuilder** | processor | ContextRow | PromptRow | Assemble LLM prompt using a strategy (generic, CoT, minimal-change, TDD) |
+| **TokenOptimizer** | processor | PromptRow | OptPromptRow | Compress only code context portion of prompt (not system instructions) to fit token limits |
 | **LLMCaller** | processor | OptPromptRow | PatchRow | Call LLM API → parse response → extract file path, old_string, new_string, reasoning |
-| **PatchApplier** | processor | PatchRow | AppliedPatchRow | Apply old→new string replacement to source files; record success/failure |
+| **PatchApplier** | processor | PatchRow | AppliedPatchRow | Apply old→new string replacement to files on disk |
 | **TestRunner_B** | processor + errorHandler | AppliedPatchRow | PassRow / EventualRow | Run relevant suite; decide pass (all pass), fail (backward correct), or eventually (exhausted) |
 | **VerdictOutputter** | outputter | PassRow, EventualRow | (terminal) | Emit final results: fixed patches + unfixed bugs with metrics |
+
+### 3.3 Source lives on disk, not in rows
+
+No SourceRow. Operators read files from disk on-demand (like Claude Code tools). Checkout emits only a lightweight `ProjectRow {project_dir, bug_id, triggering, relevant}`. ContextCollector reads source when it has the bug location. PatchApplier writes edits directly to the filesystem.
 
 ---
 
@@ -83,10 +86,12 @@ Checkout → TestRunner_A → FailLocator → ContextCollector → PromptBuilder
 
 | Instance | Position | Purpose | Outputs |
 |---|---|---|---|
-| **TestRunner_A** | After Checkout | **Localization** — find what's broken | TestResultRow (failures with stack traces) |
+| **TestRunner_A** | After Checkout | **Localization** — find what's broken | BugRow (file:line:method from stack trace) |
 | **TestRunner_B** | After PatchApplier | **Validation** — did the patch fix it? | PassRow (pass port) or backward correction (fail port) or EventualRow (eventually()) |
 
 Same operator class, different graph positions. TestRunner_A is a pure processor. TestRunner_B is a processor *and* error handler (has backward edges).
+
+FailLocator is **merged into TestRunner_A** — stack → file:line parsing is a trivial ~5 line filter (drop framework frames, take first project-owned frame). Not worth a separate node.
 
 ---
 
@@ -137,7 +142,7 @@ TestRunner_B
   └── eventually() port ──→ EventualRow → VerdictOutputter
 ```
 
-The `eventually()` output is reached when all conjecture combinations are exhausted for a given bug. The bug is recorded as unfixed with attempt metrics.
+The `eventually()` output is reached when all 32 conjecture combinations are exhausted for a given bug. The bug is recorded as unfixed with attempt metrics.
 
 ---
 
@@ -145,26 +150,31 @@ The `eventually()` output is reached when all conjecture combinations are exhaus
 
 ### 6.1 Dimensions
 
-| Dimension | Values |
-|---|---|
-| **Context level** | D (method + test file), E (full trace slice) |
-| **Prompt strategy** | generic, chain-of-thought (CoT), minimal-change, TDD |
-| **Model tier** | light (smol/haiku), heavy (claude/gpt4) |
-| **Token compression** | aggro (compress heavily), gentle (compress lightly) |
+| Dimension | Values | Count |
+|---|---|---|
+| **Context level** | D (method + test file), E (full trace slice) | 2 |
+| **Model tier** | light (smol/haiku), heavy (claude/gpt4) | 2 |
+| **Token compression** | aggro (compress heavily), gentle (compress lightly) | 2 |
+| **Prompt strategy** | generic, chain-of-thought (CoT), minimal-change, TDD | 4 |
+
+Total: **2 × 2 × 2 × 4 = 32**
 
 ### 6.2 Escalation sequence
 
-Not a full cross-product — a fixed escalation ladder of 4 conjectures:
+Ordered by cost — cheapest first. light model + D-context + aggro before heavy + E + gentle.
 
-| Step | Model | Context | Strategy | Compression |
+| Range | Model | Context | Strategy | Compression |
 |---|---|---|---|---|
-| C1 | light | D | generic | aggro |
-| C2 | light | D | CoT | aggro |
-| C3 | light | E | generic | aggro |
-| C4 | heavy | E | CoT | gentle |
-| → | *eventually()* — unfixed | | | |
+| 1-4 | light | D | generic → CoT → minimal-change → TDD | aggro |
+| 5-8 | light | D | generic → CoT → minimal-change → TDD | gentle |
+| 9-12 | light | E | generic → CoT → minimal-change → TDD | aggro |
+| 13-16 | light | E | generic → CoT → minimal-change → TDD | gentle |
+| 17-20 | heavy | D | generic → CoT → minimal-change → TDD | aggro |
+| 21-24 | heavy | D | generic → CoT → minimal-change → TDD | gentle |
+| 25-28 | heavy | E | generic → CoT → minimal-change → TDD | aggro |
+| 29-32 | heavy | E | generic → CoT → minimal-change → TDD | gentle |
 
-Rationale: try cheap conjectures first (light model, D-context). If those fail, escalate to expensive ones (E-context, heavy model). Eventually() after C4 fails.
+Rationale: try cheap conjectures first (light model, D-context, aggro compression). If those fail, escalate to expensive ones (heavy model, E-context, gentle compression). Eventually() after all 32 exhausted.
 
 ---
 
@@ -178,15 +188,23 @@ Take the first failing test, fix it, re-run the suite, cascade-fix remaining fai
 
 The pipeline takes a project source directory (e.g., `Chart/`), discovers bugs within it, and processes them one by one. Not individual bug checkouts.
 
-### 7.3 Stack trace filtering
+### 7.3 Source lives on disk — no SourceRow
+
+Operators read/write files from disk on-demand (like Claude Code tools). Checkout emits only a lightweight `ProjectRow`. ContextCollector reads source when it has the bug location. PatchApplier writes edits directly to the FS.
+
+### 7.4 FailLocator merged into TestRunner_A
+
+Stack trace → file:line is a trivial filter (drop framework frames, take first project-owned frame). Not worth a separate operator.
+
+### 7.5 Stack trace filtering
 
 Drop framework/library frames from the stack trace. Take the first project-owned frame as the bug location.
 
-### 7.4 No compile-error path
+### 7.6 No compile-error path
 
 Defects4J bugs always compile. No compile-error recovery is needed.
 
-### 7.5 PatchRow includes llm_reasoning
+### 7.7 PatchRow includes llm_reasoning
 
 ```python
 @dataclass
@@ -198,11 +216,11 @@ class PatchRow:
     reasoning: str  # LLM's explanation for the fix
 ```
 
-### 7.6 TokenOptimizer compresses only code context
+### 7.8 TokenOptimizer compresses only code context
 
 System instructions (the prompt structure, instructions to the LLM) are NOT compressed — only the surrounding method code and trace slices.
 
-### 7.7 Backward correction model (not forward cycles)
+### 7.9 Backward correction model (not forward cycles)
 
 As detailed in §5.1 — the Popper approach of editing upstream operator output is cleaner than adding cycle-aware loop state to operators.
 
@@ -212,10 +230,8 @@ As detailed in §5.1 — the Popper approach of editing upstream operator output
 
 | Row Type | Fields |
 |---|---|
-| **SourceRow** | `file_path: str, content: str` |
-| **TestRow** | `test_class: str, is_triggering: bool, is_relevant: bool` |
-| **TestResultRow** | `failures: list[{test_class, stack_trace}]` |
-| **BugRow** | `file: str, line: int, method: str, test_class: str` |
+| **ProjectRow** | `project_dir: str, bug_id: str, triggering_tests: list[str], relevant_tests: list[str]` |
+| **BugRow** | `project_dir: str, file: str, line: int, method: str, test_class: str` |
 | **ContextRow** | `level: str (D|E), method_source: str, test_source: str, trace_slice: str (E only)` |
 | **PromptRow** | `strategy: str, prompt_text: str` |
 | **OptPromptRow** | `strategy: str, prompt_text: str, tokens_saved: int` |
